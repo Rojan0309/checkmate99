@@ -471,38 +471,35 @@ class Engine:
         for move_index, move in enumerate(moves):
             is_capture = board.is_capture(move)
             is_quiet = not is_capture and move.promotion is None
+            gives_check = board.gives_check(move)
 
             # Shallow futility pruning avoids quiet moves that cannot plausibly raise alpha.
-            can_prune = (
+            if (
                 depth == 1
                 and not pv_node
                 and not in_check
                 and is_quiet
+                and not gives_check
                 and static_eval + 120 <= alpha
                 and move_index > 0
-            )
-            gives_check = can_prune and board.gives_check(move)
-            if can_prune and not gives_check:
+            ):
                 continue
-
-            reduction = 0
-            can_reduce = (
-                depth >= 3
-                and move_index >= 3
-                and is_quiet
-                and not in_check
-                and move not in self.killers[min(ply, MAX_PLY - 1)]
-            )
-            if can_reduce and not gives_check:
-                if board.gives_check(move):
-                    gives_check = True
-                else:
-                    reduction = 1 + int(depth >= 6 and move_index >= 8)
 
             board.push(move)
             child_key = _key(board)
             self.repetitions[child_key] = self.repetitions.get(child_key, 0) + 1
             try:
+                reduction = 0
+                if (
+                    depth >= 3
+                    and move_index >= 3
+                    and is_quiet
+                    and not gives_check
+                    and not in_check
+                    and move not in self.killers[min(ply, MAX_PLY - 1)]
+                ):
+                    reduction = 1 + int(depth >= 6 and move_index >= 8)
+
                 if move_index == 0:
                     score = -self._search(
                         board, depth - 1, -beta, -alpha, ply + 1, pv_node, True
@@ -719,8 +716,5 @@ def get_move(fen: str, time_left_ms: int) -> str:
         # Reliability is worth more than diagnostics in a rated game. The already-generated
         # fallback remains legal even if an unexpected search edge case occurs.
         return fallback.uci()
-
-
-
 
 

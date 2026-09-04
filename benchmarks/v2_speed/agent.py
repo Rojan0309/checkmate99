@@ -21,7 +21,6 @@ MATE: Final = 32_000
 MATE_BOUND: Final = 31_000
 MAX_PLY: Final = 96
 TT_LIMIT: Final = 250_000
-EVAL_CACHE_LIMIT: Final = 150_000
 
 EXACT: Final = 0
 LOWER: Final = 1
@@ -284,10 +283,8 @@ def _pawn_structure(white_pawns: int, black_pawns: int) -> tuple[int, int]:
 class Engine:
     def __init__(self) -> None:
         self.tt: dict[Hashable, TTEntry] = {}
-        self.eval_cache: dict[Hashable, int] = {}
         self.age = 0
         self.deadline = 0.0
-        self.time_check_mask = 511
         self.nodes = 0
         self.last_depth = 0
         self.last_score = 0
@@ -313,23 +310,12 @@ class Engine:
         # A hard deadline is checked within the tree; completed iterations stop at the softer
         # target. The reserve scales up with the clock to cover IPC and scheduler jitter.
         clock_ms = max(1, time_left_ms)
-        if clock_ms <= 30:
-            self._record_played_position(board, legal_moves[0])
-            return legal_moves[0]
         reserve_ms = max(15, min(500, clock_ms // 20))
         usable_ms = max(1, clock_ms - reserve_ms)
         soft_ms = min(4_500, max(5, int(clock_ms * 0.035)))
         hard_ms = min(usable_ms, max(soft_ms + 5, int(soft_ms * 1.65)))
         started = time.perf_counter()
         self.deadline = started + hard_ms / 1000.0
-        if clock_ms < 250:
-            self.time_check_mask = 7
-        elif clock_ms < 1_000:
-            self.time_check_mask = 31
-        elif clock_ms < 5_000:
-            self.time_check_mask = 127
-        else:
-            self.time_check_mask = 511
 
         entry = self.tt.get(root_key)
         ordered = self._ordered_moves(board, legal_moves, entry.move if entry else None, 0)
@@ -411,7 +397,7 @@ class Engine:
     ) -> int:
         self._tick()
         if ply >= MAX_PLY - 1:
-            return self._evaluate(board)
+            return evaluate(board)
 
         key = _key(board)
         if self.repetitions.get(key, 0) >= 3 or board.halfmove_clock >= 100:
@@ -435,7 +421,7 @@ class Engine:
             if entry.bound == UPPER and tt_score <= alpha:
                 return tt_score
 
-        static_eval = self._evaluate(board, key) if not in_check else -INF
+        static_eval = evaluate(board) if not in_check else -INF
 
         # Null-move pruning: if even passing the turn beats beta, ordinary moves are unlikely to
         # matter. Restrict it to positions with non-pawn material to avoid zugzwang endgames.
@@ -471,38 +457,35 @@ class Engine:
         for move_index, move in enumerate(moves):
             is_capture = board.is_capture(move)
             is_quiet = not is_capture and move.promotion is None
+            gives_check = board.gives_check(move)
 
             # Shallow futility pruning avoids quiet moves that cannot plausibly raise alpha.
-            can_prune = (
+            if (
                 depth == 1
                 and not pv_node
                 and not in_check
                 and is_quiet
+                and not gives_check
                 and static_eval + 120 <= alpha
                 and move_index > 0
-            )
-            gives_check = can_prune and board.gives_check(move)
-            if can_prune and not gives_check:
+            ):
                 continue
-
-            reduction = 0
-            can_reduce = (
-                depth >= 3
-                and move_index >= 3
-                and is_quiet
-                and not in_check
-                and move not in self.killers[min(ply, MAX_PLY - 1)]
-            )
-            if can_reduce and not gives_check:
-                if board.gives_check(move):
-                    gives_check = True
-                else:
-                    reduction = 1 + int(depth >= 6 and move_index >= 8)
 
             board.push(move)
             child_key = _key(board)
             self.repetitions[child_key] = self.repetitions.get(child_key, 0) + 1
             try:
+                reduction = 0
+                if (
+                    depth >= 3
+                    and move_index >= 3
+                    and is_quiet
+                    and not gives_check
+                    and not in_check
+                    and move not in self.killers[min(ply, MAX_PLY - 1)]
+                ):
+                    reduction = 1 + int(depth >= 6 and move_index >= 8)
+
                 if move_index == 0:
                     score = -self._search(
                         board, depth - 1, -beta, -alpha, ply + 1, pv_node, True
@@ -564,7 +547,7 @@ class Engine:
             if not moves:
                 return -MATE + ply
         else:
-            stand_pat = self._evaluate(board, key)
+            stand_pat = evaluate(board)
             if stand_pat >= beta:
                 return stand_pat
             if stand_pat > alpha:
@@ -651,7 +634,7 @@ class Engine:
 
     def _tick(self) -> None:
         self.nodes += 1
-        if self.nodes & self.time_check_mask == 0 and time.perf_counter() >= self.deadline:
+        if self.nodes & 511 == 0 and time.perf_counter() >= self.deadline:
             raise SearchTimeout
 
     def _pop_repetition(self, key: Hashable) -> None:
@@ -668,22 +651,12 @@ class Engine:
         board.pop()
 
     def _trim_tt(self) -> None:
-        if len(self.eval_cache) > EVAL_CACHE_LIMIT:
-            self.eval_cache.clear()
         if len(self.tt) <= TT_LIMIT:
             return
         cutoff = self.age - 2
         self.tt = {key: entry for key, entry in self.tt.items() if entry.age >= cutoff}
         if len(self.tt) > TT_LIMIT:
             self.tt.clear()
-    def _evaluate(self, board: chess.Board, key: Hashable | None = None) -> int:
-        position_key = _key(board) if key is None else key
-        try:
-            return self.eval_cache[position_key]
-        except KeyError:
-            score = evaluate(board)
-            self.eval_cache[position_key] = score
-            return score
 
     @staticmethod
     def _score_to_tt(score: int, ply: int) -> int:
@@ -719,8 +692,5 @@ def get_move(fen: str, time_left_ms: int) -> str:
         # Reliability is worth more than diagnostics in a rated game. The already-generated
         # fallback remains legal even if an unexpected search edge case occurs.
         return fallback.uci()
-
-
-
 
 
