@@ -1,10 +1,4 @@
-"""A compact classical chess engine for the AI Chessathon.
-
-The implementation deliberately uses python-chess for reliable move generation. Strength comes
-from iterative-deepening principal-variation search, tactical quiescence, a persistent
-transposition table, and a tapered handcrafted evaluation. No files, network, subprocesses, or
-third-party engines are used at runtime.
-"""
+"""A classical chess agent with iterative deepening and positional evaluation."""
 
 from __future__ import annotations
 
@@ -31,139 +25,6 @@ PIECE_VALUE: Final = (0, 100, 320, 330, 500, 900, 0)
 PHASE_VALUE: Final = (0, 0, 1, 1, 2, 4, 0)
 MAX_PHASE: Final = 24
 
-# PeSTO-style middlegame/endgame piece-square values. The tables are indexed from White's
-# point of view; Black's squares are mirrored vertically.
-MG_VALUE: Final = (0, 82, 337, 365, 477, 1025, 0)
-EG_VALUE: Final = (0, 94, 281, 297, 512, 936, 0)
-
-MG_TABLES: Final = (
-    (),
-    (
-        0, 0, 0, 0, 0, 0, 0, 0,
-        98, 134, 61, 95, 68, 126, 34, -11,
-        -6, 7, 26, 31, 65, 56, 25, -20,
-        -14, 13, 6, 21, 23, 12, 17, -23,
-        -27, -2, -5, 12, 17, 6, 10, -25,
-        -26, -4, -4, -10, 3, 3, 33, -12,
-        -35, -1, -20, -23, -15, 24, 38, -22,
-        0, 0, 0, 0, 0, 0, 0, 0,
-    ),
-    (
-        -167, -89, -34, -49, 61, -97, -15, -107,
-        -73, -41, 72, 36, 23, 62, 7, -17,
-        -47, 60, 37, 65, 84, 129, 73, 44,
-        -9, 17, 19, 53, 37, 69, 18, 22,
-        -13, 4, 16, 13, 28, 19, 21, -8,
-        -23, -9, 12, 10, 19, 17, 25, -16,
-        -29, -53, -12, -3, -1, 18, -14, -19,
-        -105, -21, -58, -33, -17, -28, -19, -23,
-    ),
-    (
-        -29, 4, -82, -37, -25, -42, 7, -8,
-        -26, 16, -18, -13, 30, 59, 18, -47,
-        -16, 37, 43, 40, 35, 50, 37, -2,
-        -4, 5, 19, 50, 37, 37, 7, -2,
-        -6, 13, 13, 26, 34, 12, 10, 4,
-        0, 15, 15, 15, 14, 27, 18, 10,
-        4, 15, 16, 0, 7, 21, 33, 1,
-        -33, -3, -14, -21, -13, -12, -39, -21,
-    ),
-    (
-        32, 42, 32, 51, 63, 9, 31, 43,
-        27, 32, 58, 62, 80, 67, 26, 44,
-        -5, 19, 26, 36, 17, 45, 61, 16,
-        -24, -11, 7, 26, 24, 35, -8, -20,
-        -36, -26, -12, -1, 9, -7, 6, -23,
-        -45, -25, -16, -17, 3, 0, -5, -33,
-        -44, -16, -20, -9, -1, 11, -6, -71,
-        -19, -13, 1, 17, 16, 7, -37, -26,
-    ),
-    (
-        -28, 0, 29, 12, 59, 44, 43, 45,
-        -24, -39, -5, 1, -16, 57, 28, 54,
-        -13, -17, 7, 8, 29, 56, 47, 57,
-        -27, -27, -16, -16, -1, 17, -2, 1,
-        -9, -26, -9, -10, -2, -4, 3, -3,
-        -14, 2, -11, -2, -5, 2, 14, 5,
-        -35, -8, 11, 2, 8, 15, -3, 1,
-        -1, -18, -9, 10, -15, -25, -31, -50,
-    ),
-    (
-        -65, 23, 16, -15, -56, -34, 2, 13,
-        29, -1, -20, -7, -8, -4, -38, -29,
-        -9, 24, 2, -16, -20, 6, 22, -22,
-        -17, -20, -12, -27, -30, -25, -14, -36,
-        -49, -1, -27, -39, -46, -44, -33, -51,
-        -14, -14, -22, -46, -44, -30, -15, -27,
-        1, 7, -8, -64, -43, -16, 9, 8,
-        -15, 36, 12, -54, 8, -28, 24, 14,
-    ),
-)
-
-EG_TABLES: Final = (
-    (),
-    (
-        0, 0, 0, 0, 0, 0, 0, 0,
-        178, 173, 158, 134, 147, 132, 165, 187,
-        94, 100, 85, 67, 56, 53, 82, 84,
-        32, 24, 13, 5, -2, 4, 17, 17,
-        13, 9, -3, -7, -7, -8, 3, -1,
-        4, 7, -6, 1, 0, -5, -1, -8,
-        13, 8, 8, 10, 13, 0, 2, -7,
-        0, 0, 0, 0, 0, 0, 0, 0,
-    ),
-    (
-        -58, -38, -13, -28, -31, -27, -63, -99,
-        -25, -8, -25, -2, -9, -25, -24, -52,
-        -24, -20, 10, 9, -1, -9, -19, -41,
-        -17, 3, 22, 22, 22, 11, 8, -18,
-        -18, -6, 16, 25, 16, 17, 4, -18,
-        -23, -3, -1, 15, 10, -3, -20, -22,
-        -42, -20, -10, -5, -2, -20, -23, -44,
-        -29, -51, -23, -15, -22, -18, -50, -64,
-    ),
-    (
-        -14, -21, -11, -8, -7, -9, -17, -24,
-        -8, -4, 7, -12, -3, -13, -4, -14,
-        2, -8, 0, -1, -2, 6, 0, 4,
-        -3, 9, 12, 9, 14, 10, 3, 2,
-        -6, 3, 13, 19, 7, 10, -3, -9,
-        -12, -3, 8, 10, 13, 3, -7, -15,
-        -14, -18, -7, -1, 4, -9, -15, -27,
-        -23, -9, -23, -5, -9, -16, -5, -17,
-    ),
-    (
-        13, 10, 18, 15, 12, 12, 8, 5,
-        11, 13, 13, 11, -3, 3, 8, 3,
-        7, 7, 7, 5, 4, -3, -5, -3,
-        4, 3, 13, 1, 2, 1, -1, 2,
-        3, 5, 8, 4, -5, -6, -8, -11,
-        -4, 0, -5, -1, -7, -12, -8, -16,
-        -6, -6, 0, 2, -9, -9, -11, -3,
-        -9, 2, 3, -1, -5, -13, 4, -20,
-    ),
-    (
-        -9, 22, 22, 27, 27, 19, 10, 20,
-        -17, 20, 32, 41, 58, 25, 30, 0,
-        -20, 6, 9, 49, 47, 35, 19, 9,
-        3, 22, 24, 45, 57, 40, 57, 36,
-        -18, 28, 19, 47, 31, 34, 39, 23,
-        -16, -27, 15, 6, 9, 17, 10, 5,
-        -22, -23, -30, -16, -16, -23, -36, -32,
-        -33, -28, -22, -43, -5, -32, -20, -41,
-    ),
-    (
-        -74, -35, -18, -18, -11, 15, 4, -17,
-        -12, 17, 14, 17, 17, 38, 23, 11,
-        10, 17, 23, 15, 20, 45, 44, 13,
-        -8, 22, 24, 27, 26, 33, 26, 3,
-        -18, -4, 21, 24, 27, 23, 9, -11,
-        -19, -3, 11, 21, 23, 16, 7, -9,
-        -27, -11, 4, 13, 14, 4, -5, -17,
-        -53, -34, -21, -11, -28, -14, -24, -43,
-    ),
-)
-
 FILE_MASKS: Final = tuple(chess.BB_FILES[file_index] for file_index in range(8))
 ADJACENT_FILES: Final = tuple(
     (chess.BB_FILES[file_index - 1] if file_index else 0)
@@ -173,7 +34,7 @@ ADJACENT_FILES: Final = tuple(
 
 
 class SearchTimeout(Exception):
-    """Raised internally to unwind an incomplete iteration."""
+    pass
 
 
 @dataclass(slots=True)
@@ -187,6 +48,10 @@ class TTEntry:
 
 def _key(board: chess.Board) -> Hashable:
     return board._transposition_key()
+
+
+def _tt_key(board: chess.Board) -> tuple[Hashable, int]:
+    return _key(board), board.halfmove_clock
 
 
 def _relative_rank(color: chess.Color, square: chess.Square) -> int:
@@ -209,21 +74,41 @@ PASSED_MASKS: Final = tuple(
 
 
 def evaluate(board: chess.Board) -> int:
-    """Return a tapered positional score from the side-to-move's perspective."""
     mg = 0
     eg = 0
     phase = 0
 
     for color in (chess.WHITE, chess.BLACK):
         sign = 1 if color == chess.WHITE else -1
+        own_pieces = board.occupied_co[color]
         for piece_type in chess.PIECE_TYPES:
             pieces = board.pieces_mask(piece_type, color)
             count = pieces.bit_count()
             phase += PHASE_VALUE[piece_type] * count
+            material = PIECE_VALUE[piece_type] * count
+            mg += sign * material
+            eg += sign * material
             for square in chess.scan_reversed(pieces):
-                table_square = chess.square_mirror(square) if color == chess.WHITE else square
-                mg += sign * (MG_VALUE[piece_type] + MG_TABLES[piece_type][table_square])
-                eg += sign * (EG_VALUE[piece_type] + EG_TABLES[piece_type][table_square])
+                file_index = chess.square_file(square)
+                rank = chess.square_rank(square)
+                centrality = 14 - abs(2 * file_index - 7) - abs(2 * rank - 7)
+                mobility = (board.attacks_mask(square) & ~own_pieces).bit_count()
+                if piece_type == chess.PAWN:
+                    advance = _relative_rank(color, square)
+                    mg += sign * (advance * 2 + centrality // 4)
+                    eg += sign * (advance * 5 + centrality // 4)
+                elif piece_type == chess.KNIGHT:
+                    mg += sign * (centrality * 3 + mobility * 2)
+                    eg += sign * (centrality * 2 + mobility * 2)
+                elif piece_type == chess.BISHOP:
+                    mg += sign * (centrality + mobility * 2)
+                    eg += sign * (centrality + mobility * 2)
+                elif piece_type in (chess.ROOK, chess.QUEEN):
+                    mg += sign * mobility
+                    eg += sign * mobility
+                else:
+                    mg -= sign * centrality * 2
+                    eg += sign * centrality * 3
 
         bishops = board.pieces_mask(chess.BISHOP, color)
         if bishops.bit_count() >= 2:
@@ -241,6 +126,16 @@ def evaluate(board: chess.Board) -> int:
             elif not pawns & FILE_MASKS[file_index]:
                 mg += sign * 10
 
+        king_square = board.king(color)
+        if king_square is not None:
+            shield_rank = chess.square_rank(king_square) + (1 if color else -1)
+            if 0 <= shield_rank < 8:
+                king_file = chess.square_file(king_square)
+                for file_index in range(max(0, king_file - 1), min(7, king_file + 1) + 1):
+                    shield_square = chess.square(file_index, shield_rank)
+                    if pawns & chess.BB_SQUARES[shield_square]:
+                        mg += sign * 8
+
     pawn_mg, pawn_eg = _pawn_structure(
         board.pieces_mask(chess.PAWN, chess.WHITE),
         board.pieces_mask(chess.PAWN, chess.BLACK),
@@ -256,7 +151,6 @@ def evaluate(board: chess.Board) -> int:
 
 @lru_cache(maxsize=32_768)
 def _pawn_structure(white_pawns: int, black_pawns: int) -> tuple[int, int]:
-    """Cache pawn-only terms, which stay unchanged through most search branches."""
     mg = 0
     eg = 0
     for color, pawns, enemy_pawns in (
@@ -283,7 +177,7 @@ def _pawn_structure(white_pawns: int, black_pawns: int) -> tuple[int, int]:
 
 class Engine:
     def __init__(self) -> None:
-        self.tt: dict[Hashable, TTEntry] = {}
+        self.tt: dict[tuple[Hashable, int], TTEntry] = {}
         self.eval_cache: dict[Hashable, int] = {}
         self.age = 0
         self.deadline = 0.0
@@ -294,24 +188,34 @@ class Engine:
         self.killers: list[list[chess.Move | None]] = [[None, None] for _ in range(MAX_PLY)]
         self.history = [0] * (2 * 64 * 64)
         self.repetitions: dict[Hashable, int] = {}
+        self.repeated_positions = 0
+        self.repetition_tainted = False
+        self.null_search = 0
 
-    def choose_move(self, board: chess.Board, time_left_ms: int) -> chess.Move:
-        legal_moves = list(board.legal_moves)
+    def choose_move(
+        self,
+        board: chess.Board,
+        time_left_ms: int,
+        legal_moves: list[chess.Move] | None = None,
+    ) -> chess.Move:
+        legal_moves = list(board.legal_moves) if legal_moves is None else legal_moves
         if not legal_moves:
             raise ValueError("get_move called in a terminal position")
-        if len(legal_moves) == 1:
-            return legal_moves[0]
 
         root_key = _key(board)
-        self.repetitions[root_key] = self.repetitions.get(root_key, 0) + 1
+        self._push_repetition(root_key)
         self.age += 1
         self.nodes = 0
         self.last_depth = 0
+        self.repetition_tainted = False
+        self.null_search = 0
+        if len(legal_moves) == 1:
+            self._record_played_position(board, legal_moves[0])
+            self._trim_tt()
+            return legal_moves[0]
         for pair in self.killers:
             pair[0] = pair[1] = None
 
-        # A hard deadline is checked within the tree; completed iterations stop at the softer
-        # target. The reserve scales up with the clock to cover IPC and scheduler jitter.
         clock_ms = max(1, time_left_ms)
         if clock_ms <= 30:
             self._record_played_position(board, legal_moves[0])
@@ -331,7 +235,7 @@ class Engine:
         else:
             self.time_check_mask = 511
 
-        entry = self.tt.get(root_key)
+        entry = self.tt.get(_tt_key(board))
         ordered = self._ordered_moves(board, legal_moves, entry.move if entry else None, 0)
         best_move = ordered[0]
         previous_score = 0
@@ -365,7 +269,7 @@ class Engine:
         self, board: chess.Board, depth: int, alpha: int, beta: int
     ) -> tuple[int, chess.Move]:
         original_alpha = alpha
-        key = _key(board)
+        key = _tt_key(board)
         entry = self.tt.get(key)
         moves = self._ordered_moves(
             board, list(board.legal_moves), entry.move if entry else None, 0
@@ -376,7 +280,7 @@ class Engine:
         for move_index, move in enumerate(moves):
             board.push(move)
             child_key = _key(board)
-            self.repetitions[child_key] = self.repetitions.get(child_key, 0) + 1
+            self._push_repetition(child_key)
             try:
                 if move_index == 0:
                     score = -self._search(board, depth - 1, -beta, -alpha, 1, True, True)
@@ -396,7 +300,10 @@ class Engine:
                 break
 
         bound = UPPER if best_score <= original_alpha else LOWER if best_score >= beta else EXACT
-        self.tt[key] = TTEntry(depth, self._score_to_tt(best_score, 0), bound, best_move, self.age)
+        if not self.repetition_tainted and self.repeated_positions == 0:
+            self.tt[key] = TTEntry(
+                depth, self._score_to_tt(best_score, 0), bound, best_move, self.age
+            )
         return best_score, best_move
 
     def _search(
@@ -410,23 +317,35 @@ class Engine:
         allow_null: bool,
     ) -> int:
         self._tick()
-        if ply >= MAX_PLY - 1:
-            return self._evaluate(board)
-
-        key = _key(board)
-        if self.repetitions.get(key, 0) >= 3 or board.halfmove_clock >= 100:
-            return 0
-
+        position_key = _key(board)
         in_check = board.is_check()
         if in_check:
             depth += 1
         if depth <= 0:
             return self._quiescence(board, alpha, beta, ply)
 
+        moves: list[chess.Move] | None = None
+        if self._is_insufficient_material(board):
+            return 0
+        if self._needs_draw_check(board, position_key):
+            moves = list(board.legal_moves)
+            if not moves:
+                return -MATE + ply if in_check else 0
+            if self._is_rule_draw(board, position_key, moves):
+                return 0
+        if ply >= MAX_PLY - 1:
+            if moves is None:
+                moves = list(board.legal_moves)
+            if not moves:
+                return -MATE + ply if in_check else 0
+            return self._evaluate(board, position_key)
+
         original_alpha = alpha
+        key = _tt_key(board)
         entry = self.tt.get(key)
         tt_move = entry.move if entry else None
-        if entry is not None and entry.depth >= depth:
+        tt_allowed = not self.repetition_tainted and self.repeated_positions == 0
+        if entry is not None and entry.age == self.age and entry.depth >= depth and tt_allowed:
             tt_score = self._score_from_tt(entry.score, ply)
             if entry.bound == EXACT:
                 return tt_score
@@ -435,10 +354,14 @@ class Engine:
             if entry.bound == UPPER and tt_score <= alpha:
                 return tt_score
 
-        static_eval = self._evaluate(board, key) if not in_check else -INF
+        static_eval = self._evaluate(board, position_key) if not in_check else -INF
 
-        # Null-move pruning: if even passing the turn beats beta, ordinary moves are unlikely to
-        # matter. Restrict it to positions with non-pawn material to avoid zugzwang endgames.
+        if moves is None:
+            moves = list(board.legal_moves)
+        if not moves:
+            return -MATE + ply if in_check else 0
+
+        # Non-pawn material reduces null-move errors in zugzwang endgames.
         if (
             allow_null
             and not pv_node
@@ -449,21 +372,17 @@ class Engine:
         ):
             reduction = 2 + depth // 5
             board.push(chess.Move.null())
-            null_key = _key(board)
-            self.repetitions[null_key] = self.repetitions.get(null_key, 0) + 1
+            self.null_search += 1
             try:
                 score = -self._search(
                     board, depth - 1 - reduction, -beta, -beta + 1, ply + 1, False, False
                 )
             finally:
-                self._pop_repetition(null_key)
+                self.null_search -= 1
                 board.pop()
             if score >= beta:
                 return score
 
-        moves = list(board.legal_moves)
-        if not moves:
-            return -MATE + ply if in_check else 0
         moves = self._ordered_moves(board, moves, tt_move, ply)
 
         best_score = -INF
@@ -472,7 +391,6 @@ class Engine:
             is_capture = board.is_capture(move)
             is_quiet = not is_capture and move.promotion is None
 
-            # Shallow futility pruning avoids quiet moves that cannot plausibly raise alpha.
             can_prune = (
                 depth == 1
                 and not pv_node
@@ -501,12 +419,10 @@ class Engine:
 
             board.push(move)
             child_key = _key(board)
-            self.repetitions[child_key] = self.repetitions.get(child_key, 0) + 1
+            self._push_repetition(child_key)
             try:
                 if move_index == 0:
-                    score = -self._search(
-                        board, depth - 1, -beta, -alpha, ply + 1, pv_node, True
-                    )
+                    score = -self._search(board, depth - 1, -beta, -alpha, ply + 1, pv_node, True)
                 else:
                     score = -self._search(
                         board,
@@ -544,37 +460,36 @@ class Engine:
                 break
 
         if best_move is None:
-            # Every move can only be skipped by futility pruning; the static score is then a safe
-            # fail-low result.
             return static_eval
         bound = UPPER if best_score <= original_alpha else LOWER if best_score >= beta else EXACT
-        self.tt[key] = TTEntry(
-            depth, self._score_to_tt(best_score, ply), bound, best_move, self.age
-        )
+        if not self.repetition_tainted and self.repeated_positions == 0:
+            self.tt[key] = TTEntry(
+                depth, self._score_to_tt(best_score, ply), bound, best_move, self.age
+            )
         return best_score
 
     def _quiescence(self, board: chess.Board, alpha: int, beta: int, ply: int) -> int:
         self._tick()
-        key = _key(board)
-        if self.repetitions.get(key, 0) >= 3 or board.halfmove_clock >= 100:
-            return 0
+        position_key = _key(board)
         in_check = board.is_check()
+        legal_moves = list(board.legal_moves)
+        if not legal_moves:
+            return -MATE + ply if in_check else 0
+        if self._is_rule_draw(board, position_key, legal_moves):
+            return 0
+        if ply >= MAX_PLY - 1:
+            return self._evaluate(board, position_key)
+
         if in_check:
-            moves = list(board.legal_moves)
-            if not moves:
-                return -MATE + ply
+            moves = legal_moves
         else:
-            stand_pat = self._evaluate(board, key)
+            stand_pat = self._evaluate(board, position_key)
             if stand_pat >= beta:
                 return stand_pat
             if stand_pat > alpha:
                 alpha = stand_pat
-            if ply >= MAX_PLY - 1:
-                return alpha
             moves = [
-                move
-                for move in board.legal_moves
-                if board.is_capture(move) or move.promotion is not None
+                move for move in legal_moves if board.is_capture(move) or move.promotion is not None
             ]
 
         moves = self._ordered_moves(board, moves, None, min(ply, MAX_PLY - 1))
@@ -585,7 +500,7 @@ class Engine:
                     continue
             board.push(move)
             child_key = _key(board)
-            self.repetitions[child_key] = self.repetitions.get(child_key, 0) + 1
+            self._push_repetition(child_key)
             try:
                 score = -self._quiescence(board, -beta, -alpha, ply + 1)
             finally:
@@ -654,17 +569,76 @@ class Engine:
         if self.nodes & self.time_check_mask == 0 and time.perf_counter() >= self.deadline:
             raise SearchTimeout
 
+    @staticmethod
+    def _is_insufficient_material(board: chess.Board) -> bool:
+        if board.pawns or board.rooks or board.queens:
+            return False
+        return board.is_insufficient_material()
+
+    def _needs_draw_check(self, board: chess.Board, position_key: Hashable) -> bool:
+        return self.null_search == 0 and (
+            board.halfmove_clock >= 99
+            or self.repetitions.get(position_key, 0) >= 3
+            or self.repeated_positions > 0
+        )
+
+    def _is_rule_draw(
+        self,
+        board: chess.Board,
+        position_key: Hashable,
+        legal_moves: list[chess.Move],
+    ) -> bool:
+        if self._is_insufficient_material(board):
+            return True
+        if self.null_search:
+            return False
+
+        if self.repetitions.get(position_key, 0) >= 3:
+            self.repetition_tainted = True
+            return True
+        if board.halfmove_clock >= 100:
+            return True
+        if board.halfmove_clock >= 99:
+            for move in legal_moves:
+                if board.is_zeroing(move):
+                    continue
+                board.push(move)
+                try:
+                    if board.is_fifty_moves():
+                        return True
+                finally:
+                    board.pop()
+
+        if self.repeated_positions:
+            for move in legal_moves:
+                board.push(move)
+                try:
+                    if self.repetitions.get(_key(board), 0) >= 2:
+                        self.repetition_tainted = True
+                        return True
+                finally:
+                    board.pop()
+        return False
+
+    def _push_repetition(self, key: Hashable) -> None:
+        count = self.repetitions.get(key, 0)
+        self.repetitions[key] = count + 1
+        if count == 1:
+            self.repeated_positions += 1
+
     def _pop_repetition(self, key: Hashable) -> None:
-        count = self.repetitions[key] - 1
-        if count:
-            self.repetitions[key] = count
+        count = self.repetitions[key]
+        if count == 2:
+            self.repeated_positions -= 1
+        if count > 1:
+            self.repetitions[key] = count - 1
         else:
             del self.repetitions[key]
 
     def _record_played_position(self, board: chess.Board, move: chess.Move) -> None:
         board.push(move)
         child_key = _key(board)
-        self.repetitions[child_key] = self.repetitions.get(child_key, 0) + 1
+        self._push_repetition(child_key)
         board.pop()
 
     def _trim_tt(self) -> None:
@@ -676,6 +650,7 @@ class Engine:
         self.tt = {key: entry for key, entry in self.tt.items() if entry.age >= cutoff}
         if len(self.tt) > TT_LIMIT:
             self.tt.clear()
+
     def _evaluate(self, board: chess.Board, key: Hashable | None = None) -> int:
         position_key = _key(board) if key is None else key
         try:
@@ -706,21 +681,14 @@ _ENGINE = Engine()
 
 
 def get_move(fen: str, time_left_ms: int) -> str:
-    """Return a legal UCI move, with a deterministic legal fallback on search failure."""
+    """Return a legal move in UCI notation."""
     board = chess.Board(fen)
     legal_moves = list(board.legal_moves)
     if not legal_moves:
         return "0000"  # The referee never requests a move from a terminal position.
     fallback = legal_moves[0]
     try:
-        move = _ENGINE.choose_move(board, time_left_ms)
+        move = _ENGINE.choose_move(board, time_left_ms, legal_moves)
         return move.uci() if move in board.legal_moves else fallback.uci()
     except Exception:
-        # Reliability is worth more than diagnostics in a rated game. The already-generated
-        # fallback remains legal even if an unexpected search edge case occurs.
         return fallback.uci()
-
-
-
-
-
