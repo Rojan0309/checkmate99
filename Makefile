@@ -6,10 +6,10 @@ setup:
 	uv sync
 
 play:
-	uv run python -m harness.play --white . --black baselines/greedy $(if $(FEN),--fen "$(FEN)")
+	uv run python -m harness.play --white . --black baselines/numba $(if $(FEN),--fen "$(FEN)")
 
 arena:
-	uv run python -m harness.arena --opponent baselines/greedy --games 20
+	uv run python -m harness.arena --opponent baselines/numba --games 20
 
 zip:
 	uv run python -m harness.package
