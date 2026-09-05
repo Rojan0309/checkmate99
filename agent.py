@@ -566,6 +566,8 @@ class Engine:
 
     def _tick(self) -> None:
         self.nodes += 1
+        if self.nodes % 50_000 == 0:
+            self._trim_tt()
         if self.nodes & self.time_check_mask == 0 and time.perf_counter() >= self.deadline:
             raise SearchTimeout
 
