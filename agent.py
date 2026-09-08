@@ -185,6 +185,7 @@ class Engine:
         self.nodes = 0
         self.last_depth = 0
         self.last_score = 0
+        self.timed_out_during_next_depth = False
         self.killers: list[list[chess.Move | None]] = [[None, None] for _ in range(MAX_PLY)]
         self.history = [0] * (2 * 64 * 64)
         self.repetitions: dict[Hashable, int] = {}
@@ -207,6 +208,7 @@ class Engine:
         self.age += 1
         self.nodes = 0
         self.last_depth = 0
+        self.timed_out_during_next_depth = False
         self.repetition_tainted = False
         self.null_search = 0
         if len(legal_moves) == 1:
@@ -253,6 +255,7 @@ class Engine:
                 else:
                     score, move = self._root(board, depth, -INF, INF)
             except SearchTimeout:
+                self.timed_out_during_next_depth = True
                 break
             best_move = move
             previous_score = score
@@ -368,6 +371,7 @@ class Engine:
             and not in_check
             and depth >= 3
             and static_eval >= beta
+            and static_eval > -PIECE_VALUE[chess.QUEEN]
             and self._has_non_pawn_material(board, board.turn)
         ):
             reduction = 2 + depth // 5
