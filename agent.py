@@ -9,9 +9,11 @@ import time
 from collections.abc import Hashable
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Final
 
 import chess
+import chess.syzygy
 
 INF: Final = 40_000
 MATE: Final = 32_000
@@ -32,12 +34,33 @@ SEE_VALUE: Final = (0, 100, 320, 330, 500, 900, 20_000)
 PHASE_VALUE: Final = (0, 0, 1, 1, 2, 4, 0)
 MAX_PHASE: Final = 24
 
+# Passed pawns become nonlinear assets in the endgame.  Indexes are relative
+# ranks (a white pawn on the seventh rank, for example, has index 6).
+PASSED_MG_BONUS: Final = (0, 0, 8, 18, 38, 75, 140, 0)
+PASSED_EG_BONUS: Final = (0, 4, 12, 30, 70, 150, 200, 0)
+
 FILE_MASKS: Final = tuple(chess.BB_FILES[file_index] for file_index in range(8))
 ADJACENT_FILES: Final = tuple(
     (chess.BB_FILES[file_index - 1] if file_index else 0)
     | (chess.BB_FILES[file_index + 1] if file_index < 7 else 0)
     for file_index in range(8)
 )
+KING_DISTANCE: Final = tuple(
+    tuple(chess.square_distance(first, second) for second in chess.SQUARES)
+    for first in chess.SQUARES
+)
+
+
+def _open_tablebase() -> chess.syzygy.Tablebase | None:
+    """Open the optional shipped subset; any filesystem/data issue disables it safely."""
+    try:
+        path = Path(__file__).resolve().parent / "syzygy"
+        return chess.syzygy.open_tablebase(str(path)) if path.is_dir() else None
+    except Exception:
+        return None
+
+
+TABLEBASE: Final = _open_tablebase()
 
 LMR_MAX_DEPTH: Final = 64
 LMR_MAX_INDEX: Final = 64
@@ -118,7 +141,9 @@ def _detect_attackers_mask_supports_occupied() -> bool:
 _ATTACKERS_SUPPORTS_OCCUPIED: Final = _detect_attackers_mask_supports_occupied()
 
 
-def _attackers_for_see(board: chess.Board, color: chess.Color, square: chess.Square, occupied: int) -> int:
+def _attackers_for_see(
+    board: chess.Board, color: chess.Color, square: chess.Square, occupied: int
+) -> int:
     if _ATTACKERS_SUPPORTS_OCCUPIED:
         return board.attackers_mask(color, square, occupied)
     return int(board.attackers(color, square)) & occupied
@@ -219,6 +244,8 @@ def evaluate(board: chess.Board) -> int:
 
     white_king_zone = _king_zone(board, chess.WHITE)
     black_king_zone = _king_zone(board, chess.BLACK)
+    queen_count = board.queens.bit_count()
+    rook_count = board.rooks.bit_count()
 
     for color in (chess.WHITE, chess.BLACK):
         sign = 1 if color == chess.WHITE else -1
@@ -258,7 +285,11 @@ def evaluate(board: chess.Board) -> int:
                     eg += sign * mobility
                 else:
                     mg -= sign * centrality * 2
-                    eg += sign * centrality * 3
+                    # Central kings are desirable only as major-piece danger fades.
+                    # A queen on the board makes generic centralisation actively risky;
+                    # specialised mating guidance below handles the attacking king.
+                    king_activity = 0 if queen_count else 2 if rook_count else 4
+                    eg += sign * centrality * king_activity
 
         bishops = board.pieces_mask(chess.BISHOP, color)
         if bishops.bit_count() >= 2:
@@ -297,6 +328,8 @@ def evaluate(board: chess.Board) -> int:
     eg += pawn_eg
 
     phase = min(phase, MAX_PHASE)
+    if phase <= 8:
+        eg += _endgame_adjustment(board)
     score = (mg * phase + eg * (MAX_PHASE - phase)) // MAX_PHASE
     score += 10 if board.turn == chess.WHITE else -10
     return score if board.turn == chess.WHITE else -score
@@ -323,9 +356,389 @@ def _pawn_structure(white_pawns: int, black_pawns: int) -> tuple[int, int]:
                 eg -= sign * 14
             if not enemy_pawns & PASSED_MASKS[int(color)][square]:
                 rank = _relative_rank(color, square)
-                mg += sign * (rank * rank * 3)
-                eg += sign * (rank * rank * 7)
+                passer_mg = PASSED_MG_BONUS[rank]
+                passer_eg = PASSED_EG_BONUS[rank]
+
+                pawn_attackers = chess.BB_PAWN_ATTACKS[not color][square] & pawns
+                if pawn_attackers:
+                    passer_mg += 4 + rank * 3
+                    passer_eg += 8 + rank * 7
+
+                neighbours = pawns & ADJACENT_FILES[file_index]
+                if any(
+                    abs(_relative_rank(color, neighbour) - rank) <= 1
+                    and not enemy_pawns & PASSED_MASKS[int(color)][neighbour]
+                    for neighbour in chess.scan_reversed(neighbours)
+                ):
+                    passer_mg += 5 + rank * 3
+                    passer_eg += 10 + rank * 8
+
+                promotion_square = chess.square(file_index, 7 if color else 0)
+                path = chess.between(square, promotion_square) | chess.BB_SQUARES[promotion_square]
+                if not (white_pawns | black_pawns) & path:
+                    passer_mg += rank * 2
+                    passer_eg += rank * 5
+
+                mg += sign * passer_mg
+                eg += sign * passer_eg
     return mg, eg
+
+
+def _material_vector(board: chess.Board, color: chess.Color) -> tuple[int, int, int, int, int]:
+    return (
+        board.pieces_mask(chess.PAWN, color).bit_count(),
+        board.pieces_mask(chess.KNIGHT, color).bit_count(),
+        board.pieces_mask(chess.BISHOP, color).bit_count(),
+        board.pieces_mask(chess.ROOK, color).bit_count(),
+        board.pieces_mask(chess.QUEEN, color).bit_count(),
+    )
+
+
+def _endgame_class(board: chess.Board) -> str | None:
+    """A small, position-independent material classifier used by evaluation and tests."""
+    white = _material_vector(board, chess.WHITE)
+    black = _material_vector(board, chess.BLACK)
+
+    for strong, weak in ((white, black), (black, white)):
+        if sum(weak) == 0:
+            if strong == (0, 0, 0, 0, 1):
+                return "KQK"
+            if strong == (0, 0, 0, 1, 0):
+                return "KRK"
+            if strong == (0, 0, 2, 0, 0):
+                bishops = board.bishops
+                if bishops & chess.BB_LIGHT_SQUARES and bishops & chess.BB_DARK_SQUARES:
+                    return "KBBK"
+            if strong == (0, 1, 1, 0, 0):
+                return "KBNK"
+            if strong[0] == 1 and sum(strong[1:]) == 0:
+                return "KPK"
+            if strong[0] > 1 and sum(strong[1:]) == 0:
+                return "KPPK"
+            if strong[4] >= 1:
+                return "KQXK"
+            if strong[3] >= 1:
+                return "KRXK"
+
+        if (
+            strong == (0, 0, 0, 0, 1)
+            and weak[0] == weak[3] == weak[4] == 0
+            and weak[1] + weak[2] == 1
+        ):
+            return "KQ_MINOR"
+        if (
+            strong == (0, 0, 0, 1, 0)
+            and weak[0] == weak[3] == weak[4] == 0
+            and weak[1] + weak[2] == 1
+        ):
+            return "KR_MINOR_DRAWISH"
+
+    if (
+        white[1] == black[1] == white[3] == black[3] == white[4] == black[4] == 0
+        and white[2] == black[2] == 1
+    ):
+        white_bishop = next(iter(board.pieces(chess.BISHOP, chess.WHITE)))
+        black_bishop = next(iter(board.pieces(chess.BISHOP, chess.BLACK)))
+        same_color = bool(chess.BB_SQUARES[white_bishop] & chess.BB_LIGHT_SQUARES) == bool(
+            chess.BB_SQUARES[black_bishop] & chess.BB_LIGHT_SQUARES
+        )
+        return "SAME_BISHOPS" if same_color else "OPPOSITE_BISHOPS"
+
+    if (
+        white[1] == black[1] == white[2] == black[2] == white[4] == black[4] == 0
+        and white[3] == black[3] == 1
+        and white[0] + black[0] > 0
+    ):
+        return "ROOK_PAWNS"
+    if (
+        white[1] == black[1] == white[2] == black[2] == white[3] == black[3] == 0
+        and white[4] == black[4] == 1
+        and white[0] + black[0] > 0
+    ):
+        return "QUEEN_PAWNS"
+    return None
+
+
+def _only_king(board: chess.Board, color: chess.Color) -> bool:
+    return board.occupied_co[color] == board.kings & board.occupied_co[color]
+
+
+def _mating_guidance(board: chess.Board, endgame_class: str | None) -> int:
+    if endgame_class not in {"KQK", "KRK", "KBBK", "KQXK", "KRXK", "KQ_MINOR"}:
+        return 0
+
+    if _only_king(board, chess.BLACK):
+        strong = chess.WHITE
+    elif _only_king(board, chess.WHITE):
+        strong = chess.BLACK
+    elif endgame_class == "KQ_MINOR":
+        strong = chess.WHITE if board.queens & board.occupied_co[chess.WHITE] else chess.BLACK
+    else:
+        return 0
+
+    weak = not strong
+    strong_king = board.king(strong)
+    weak_king = board.king(weak)
+    if strong_king is None or weak_king is None:
+        return 0
+
+    weak_file = chess.square_file(weak_king)
+    weak_rank = chess.square_rank(weak_king)
+    edge_distance = 3 - min(weak_file, 7 - weak_file, weak_rank, 7 - weak_rank)
+
+    attacked = 0
+    for square in chess.scan_reversed(board.occupied_co[strong]):
+        attacked |= board.attacks_mask(square)
+    safe_ring = chess.BB_KING_ATTACKS[weak_king] & ~attacked
+    restriction = 8 - safe_ring.bit_count()
+    proximity = 7 - KING_DISTANCE[strong_king][weak_king]
+
+    scale = 1 if endgame_class == "KQ_MINOR" else 2
+    bonus = (edge_distance * 28 + restriction * 9 + proximity * 8) * scale
+
+    majors = (board.queens | board.rooks) & board.occupied_co[strong]
+    for square in chess.scan_reversed(majors):
+        if KING_DISTANCE[weak_king][square] <= 1 and KING_DISTANCE[strong_king][square] > 1:
+            bonus -= 700
+
+    return bonus if strong == chess.WHITE else -bonus
+
+
+def _is_passed(board: chess.Board, color: chess.Color, square: chess.Square) -> bool:
+    return not (board.pieces_mask(chess.PAWN, not color) & PASSED_MASKS[int(color)][square])
+
+
+def _promotion_path(
+    board: chess.Board, color: chess.Color, square: chess.Square
+) -> tuple[chess.Square, ...]:
+    rank = _relative_rank(color, square)
+    if not 1 <= rank <= 6:
+        return ()
+    step = 8 if color == chess.WHITE else -8
+    first = square + step
+    if board.occupied & chess.BB_SQUARES[first]:
+        return ()
+
+    path: list[chess.Square] = []
+    current = square
+    if rank == 1:
+        double = square + 2 * step
+        if not board.occupied & chess.BB_SQUARES[double]:
+            current = double
+            path.append(current)
+    while _relative_rank(color, current) < 7:
+        current += step
+        if board.occupied & chess.BB_SQUARES[current]:
+            return ()
+        path.append(current)
+    return tuple(path)
+
+
+def _king_can_catch_pawn(
+    board: chess.Board,
+    color: chess.Color,
+    square: chess.Square,
+    path: tuple[chess.Square, ...],
+) -> bool:
+    enemy_king = board.king(not color)
+    own_king = board.king(color)
+    if enemy_king is None:
+        return False
+    own_pawns = board.pieces_mask(chess.PAWN, color) & ~chess.BB_SQUARES[square]
+    for move_number, target in enumerate(path, start=1):
+        king_moves = move_number if board.turn != color else move_number - 1
+        if KING_DISTANCE[enemy_king][target] > king_moves:
+            continue
+        protected = own_king is not None and KING_DISTANCE[own_king][target] <= 1
+        protected |= bool(chess.BB_PAWN_ATTACKS[not color][target] & own_pawns)
+        if not protected:
+            return True
+    return False
+
+
+def _queen_line_attack(from_square: chess.Square, to_square: chess.Square, occupied: int) -> bool:
+    file_delta = abs(chess.square_file(from_square) - chess.square_file(to_square))
+    rank_delta = abs(chess.square_rank(from_square) - chess.square_rank(to_square))
+    if file_delta != 0 and rank_delta != 0 and file_delta != rank_delta:
+        return False
+    return not bool(chess.between(from_square, to_square) & occupied)
+
+
+def _promotion_info(
+    board: chess.Board, color: chess.Color, square: chess.Square
+) -> tuple[int, chess.Square, bool] | None:
+    if not _is_passed(board, color, square):
+        return None
+    path = _promotion_path(board, color, square)
+    if not path or _king_can_catch_pawn(board, color, square, path):
+        return None
+    plies = 2 * len(path) - int(board.turn == color)
+    promotion_square = path[-1]
+    enemy_king = board.king(not color)
+    occupied = (board.occupied & ~chess.BB_SQUARES[square]) | chess.BB_SQUARES[promotion_square]
+    promotes_with_check = enemy_king is not None and _queen_line_attack(
+        promotion_square, enemy_king, occupied
+    )
+    return plies, promotion_square, promotes_with_check
+
+
+def _pawn_race_adjustment(board: chess.Board) -> int:
+    if board.knights or board.bishops or board.rooks or board.queens:
+        return 0
+
+    racers: dict[chess.Color, list[tuple[int, chess.Square, bool, chess.Square]]] = {
+        chess.WHITE: [],
+        chess.BLACK: [],
+    }
+    for color in (chess.WHITE, chess.BLACK):
+        for square in chess.scan_reversed(board.pieces_mask(chess.PAWN, color)):
+            info = _promotion_info(board, color, square)
+            if info is not None:
+                racers[color].append((*info, square))
+
+    white = min(racers[chess.WHITE], default=None)
+    black = min(racers[chess.BLACK], default=None)
+    if white is None and black is None:
+        return 0
+    if black is None:
+        return 100 + max(0, 13 - white[0]) * 8 if white is not None else 0
+    if white is None:
+        return -(100 + max(0, 13 - black[0]) * 8)
+
+    white_tempo = white[0] - int(white[2])
+    black_tempo = black[0] - int(black[2])
+    if white_tempo == black_tempo:
+        return 0
+
+    white_first = white_tempo < black_tempo
+    faster = white if white_first else black
+    slower = black if white_first else white
+    advantage = 130 + abs(white_tempo - black_tempo) * 40
+    occupied_after = (board.occupied & ~chess.BB_SQUARES[faster[3]]) | chess.BB_SQUARES[faster[1]]
+    if _queen_line_attack(faster[1], slower[3], occupied_after) or _queen_line_attack(
+        faster[1], slower[1], occupied_after
+    ):
+        advantage += 70
+    return advantage if white_first else -advantage
+
+
+def _passed_pawn_adjustment(board: chess.Board) -> int:
+    score = 0
+    for color in (chess.WHITE, chess.BLACK):
+        sign = 1 if color == chess.WHITE else -1
+        own_king = board.king(color)
+        enemy_king = board.king(not color)
+        enemy_stoppers = (board.rooks | board.queens) & board.occupied_co[not color]
+        own_rooks = board.rooks & board.occupied_co[color]
+        for square in chess.scan_reversed(board.pieces_mask(chess.PAWN, color)):
+            if not _is_passed(board, color, square):
+                continue
+            rank = _relative_rank(color, square)
+            step = 8 if color == chess.WHITE else -8
+            front = square + step
+            promotion_square = chess.square(chess.square_file(square), 7 if color else 0)
+            bonus = 0
+
+            path = chess.between(square, promotion_square) | chess.BB_SQUARES[promotion_square]
+            path_clear = not bool(board.occupied & path)
+            if path_clear:
+                bonus += rank * 7
+
+            if own_king is not None and enemy_king is not None:
+                target = front if 0 <= front < 64 else square
+                distance_scale = 4 + rank * 2
+                bonus += (
+                    KING_DISTANCE[enemy_king][target] - KING_DISTANCE[own_king][target]
+                ) * distance_scale
+
+            if board.attackers_mask(color, square) & ~chess.BB_SQUARES[square]:
+                bonus += 5 + rank * 5
+
+            rooks_on_file = own_rooks & FILE_MASKS[chess.square_file(square)]
+            for rook_square in chess.scan_reversed(rooks_on_file):
+                if _relative_rank(color, rook_square) < rank and not (
+                    chess.between(rook_square, square) & board.occupied
+                ):
+                    bonus += 18 + rank * 4
+                    break
+
+            if enemy_stoppers and (
+                board.is_attacked_by(not color, front)
+                or board.is_attacked_by(not color, promotion_square)
+            ):
+                bonus -= 18 + rank * 7
+
+            if rank == 6 and not board.occupied & chess.BB_SQUARES[front]:
+                bonus += 110 if board.turn == color else 70
+            score += sign * bonus
+    return score
+
+
+def _opposition_adjustment(board: chess.Board) -> int:
+    if board.knights or board.bishops or board.rooks or board.queens:
+        return 0
+    white_king = board.king(chess.WHITE)
+    black_king = board.king(chess.BLACK)
+    if white_king is None or black_king is None or KING_DISTANCE[white_king][black_king] != 2:
+        return 0
+    same_file = chess.square_file(white_king) == chess.square_file(black_king)
+    same_rank = chess.square_rank(white_king) == chess.square_rank(black_king)
+    if not (same_file or same_rank):
+        return 0
+    return 18 if board.turn == chess.BLACK else -18
+
+
+def _endgame_adjustment(board: chess.Board) -> int:
+    endgame_class = _endgame_class(board)
+    score = _mating_guidance(board, endgame_class)
+    score += _passed_pawn_adjustment(board)
+    score += _pawn_race_adjustment(board)
+    score += _opposition_adjustment(board)
+
+    if endgame_class == "OPPOSITE_BISHOPS":
+        pawn_balance = (
+            board.pieces_mask(chess.PAWN, chess.WHITE).bit_count()
+            - board.pieces_mask(chess.PAWN, chess.BLACK).bit_count()
+        )
+        score -= max(-90, min(90, pawn_balance * 24))
+    elif endgame_class == "KR_MINOR_DRAWISH":
+        white_has_rook = bool(board.rooks & board.occupied_co[chess.WHITE])
+        score += -130 if white_has_rook else 130
+    return score
+
+
+def _tablebase_move(board: chess.Board, legal_moves: list[chess.Move]) -> chess.Move | None:
+    """Choose an exact root move only when every child is covered by the shipped subset."""
+    if TABLEBASE is None or board.occupied.bit_count() > 4:
+        return None
+    try:
+        TABLEBASE.probe_wdl(board)
+        ranked: list[tuple[tuple[int, int, int], chess.Move]] = []
+        root_color = board.turn
+        for move in legal_moves:
+            board.push(move)
+            try:
+                outcome = board.outcome(claim_draw=True)
+                if outcome is not None:
+                    wdl = 0 if outcome.winner is None else 2 if outcome.winner == root_color else -2
+                    distance = 0
+                else:
+                    wdl = -TABLEBASE.probe_wdl(board)
+                    distance = abs(TABLEBASE.probe_dtz(board))
+            finally:
+                board.pop()
+
+            if wdl > 0:
+                distance_score = -distance
+            elif wdl < 0:
+                distance_score = distance
+            else:
+                distance_score = 0
+            promotion_score = PIECE_VALUE[move.promotion] if move.promotion else 0
+            ranked.append(((wdl, distance_score, promotion_score), move))
+        return max(ranked, key=lambda item: item[0])[1] if ranked else None
+    except Exception:
+        return None
 
 
 class Engine:
@@ -367,13 +780,20 @@ class Engine:
             self._record_played_position(board, legal_moves[0])
             self._trim_tt()
             return legal_moves[0]
-        for pair in self.killers:
-            pair[0] = pair[1] = None
 
         clock_ms = max(1, time_left_ms)
-        if clock_ms <= 30:
+        if clock_ms <= 100:
             self._record_played_position(board, legal_moves[0])
             return legal_moves[0]
+
+        tablebase_move = _tablebase_move(board, legal_moves)
+        if tablebase_move is not None:
+            self._record_played_position(board, tablebase_move)
+            self._trim_tt()
+            print(f"[tablebase move={tablebase_move.uci()}]", file=sys.stderr)
+            return tablebase_move
+        for pair in self.killers:
+            pair[0] = pair[1] = None
 
         soft_ms, hard_ms = self._time_budget(board, clock_ms)
         started = time.perf_counter()
@@ -451,10 +871,7 @@ class Engine:
                 target_ms = max(soft_ms * 0.4, target_ms * 0.75)
 
         elapsed_ms = (time.perf_counter() - started) * 1000.0
-        if elapsed_ms > 0:
-            nps = int(self.nodes / (elapsed_ms / 1000.0))
-        else:
-            nps = 0
+        nps = int(self.nodes / (elapsed_ms / 1000.0)) if elapsed_ms > 0 else 0
         print(
             f"[depth={self.last_depth} nodes={self.nodes} nps={nps} "
             f"time={elapsed_ms:.0f}ms clock={clock_ms}ms score={self.last_score}]",
@@ -469,7 +886,8 @@ class Engine:
         non_king_material = sum(
             PIECE_VALUE[piece_type]
             * (
-                board.pieces_mask(piece_type, chess.WHITE) | board.pieces_mask(piece_type, chess.BLACK)
+                board.pieces_mask(piece_type, chess.WHITE)
+                | board.pieces_mask(piece_type, chess.BLACK)
             ).bit_count()
             for piece_type in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
         )
@@ -592,6 +1010,7 @@ class Engine:
                 return tt_score
 
         static_eval = self._evaluate(board, position_key) if not in_check else -INF
+        endgame_sensitive = self._zugzwang_sensitive(board)
 
         if moves is None:
             moves = list(board.legal_moves)
@@ -620,6 +1039,7 @@ class Engine:
             and depth >= 3
             and static_eval >= beta
             and self._has_non_pawn_material(board, board.turn)
+            and not endgame_sensitive
         ):
             reduction = 2 + depth // 5
             board.push(chess.Move.null())
@@ -645,11 +1065,17 @@ class Engine:
         best_score = -INF
         best_move: chess.Move | None = None
         for move_index, (move, is_quiet, is_capture, see_value) in enumerate(ordered):
+            moving_piece = board.piece_type_at(move.from_square)
+            critical_pawn_push = moving_piece == chess.PAWN and (
+                _relative_rank(board.turn, move.to_square) >= 5
+                or _is_passed(board, board.turn, move.from_square)
+            )
             can_prune = (
                 depth == 1
                 and not pv_node
                 and not in_check
                 and is_quiet
+                and not critical_pawn_push
                 and static_eval + 120 <= alpha
                 and move_index > 0
             )
@@ -673,13 +1099,16 @@ class Engine:
                 and move_index >= 3
                 and is_quiet
                 and not in_check
+                and not critical_pawn_push
                 and move not in self.killers[min(ply, MAX_PLY - 1)]
             )
             if can_reduce and not gives_check:
                 if board.gives_check(move):
                     gives_check = True
                 else:
-                    reduction = LMR_TABLE[min(depth, LMR_MAX_DEPTH - 1)][min(move_index, LMR_MAX_INDEX - 1)]
+                    reduction = LMR_TABLE[min(depth, LMR_MAX_DEPTH - 1)][
+                        min(move_index, LMR_MAX_INDEX - 1)
+                    ]
                     if pv_node:
                         reduction = max(0, reduction - 1)
                     reduction = max(0, min(reduction, depth - 1))
@@ -815,13 +1244,25 @@ class Engine:
             else:
                 score = self.history[self._history_index(color, move)]
 
+            moving_piece = board.piece_type_at(move.from_square)
+            if (
+                is_quiet
+                and moving_piece == chess.PAWN
+                and _is_passed(board, color, move.from_square)
+            ):
+                rank = _relative_rank(color, move.to_square)
+                score += 1_000_000 + rank * rank * 40_000
+
             scored.append((score, move, is_quiet, is_capture, see_value))
 
         if time.perf_counter() >= self.deadline:
             raise SearchTimeout
 
         scored.sort(key=lambda item: item[0], reverse=True)
-        return [(move, is_quiet, is_capture, see_value) for _, move, is_quiet, is_capture, see_value in scored]
+        return [
+            (move, is_quiet, is_capture, see_value)
+            for _, move, is_quiet, is_capture, see_value in scored
+        ]
 
     @staticmethod
     def _has_non_pawn_material(board: chess.Board, color: chess.Color) -> bool:
@@ -831,6 +1272,16 @@ class Engine:
             | board.pieces_mask(chess.ROOK, color)
             | board.pieces_mask(chess.QUEEN, color)
         )
+
+    @staticmethod
+    def _zugzwang_sensitive(board: chess.Board) -> bool:
+        pawns = board.pawns.bit_count()
+        non_pawns = (board.knights | board.bishops | board.rooks | board.queens).bit_count()
+        if pawns == 0 and non_pawns <= 3:
+            return True
+        if board.queens:
+            return False
+        return pawns <= 8 and non_pawns <= 2
 
     @staticmethod
     def _history_index(color: chess.Color, move: chess.Move) -> int:
@@ -964,10 +1415,7 @@ def _emergency_move(board: chess.Board, legal_moves: list[chess.Move]) -> chess.
     best_move = legal_moves[0]
     best_score = -INF
     for move in legal_moves:
-        if board.is_capture(move) or move.promotion is not None:
-            score = see(board, move)
-        else:
-            score = 0
+        score = see(board, move) if board.is_capture(move) or move.promotion is not None else 0
         board.push(move)
         is_mate = board.is_checkmate()
         board.pop()
