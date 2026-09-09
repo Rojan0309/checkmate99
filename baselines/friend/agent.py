@@ -67,62 +67,6 @@ def _passed_mask(color: chess.Color, square: chess.Square) -> int:
     return files & ahead & chess.BB_ALL
 
 
-def _king_zone(board: chess.Board, color: chess.Color) -> int:
-    king_square = board.king(color)
-    if king_square is None:
-        return 0
-    king_file = chess.square_file(king_square)
-    king_rank = chess.square_rank(king_square)
-    zone = 0
-    for rank_offset in (-1, 0, 1):
-        target_rank = king_rank + rank_offset
-        if not 0 <= target_rank < 8:
-            continue
-        for file_offset in (-1, 0, 1):
-            target_file = king_file + file_offset
-            if 0 <= target_file < 8:
-                zone |= chess.BB_SQUARES[chess.square(target_file, target_rank)]
-    return zone
-
-
-def _king_safety(board: chess.Board, color: chess.Color) -> int:
-    king_square = board.king(color)
-    if king_square is None:
-        return -MATE
-    enemy = not color
-    zone = _king_zone(board, color)
-    pressure = (board.attackers_mask(enemy, king_square) & chess.BB_ALL).bit_count()
-    zone_pressure = 0
-    for square in chess.scan_reversed(zone):
-        zone_pressure += (board.attackers_mask(enemy, square) & chess.BB_ALL).bit_count()
-    own_pawns = board.pieces_mask(chess.PAWN, color)
-    shield_rank = chess.square_rank(king_square) + (1 if color else -1)
-    shield = 0
-    if 0 <= shield_rank < 8:
-        king_file = chess.square_file(king_square)
-        for file_index in range(max(0, king_file - 1), min(7, king_file + 1) + 1):
-            shield += bool(own_pawns & chess.BB_SQUARES[chess.square(file_index, shield_rank)])
-    return -pressure * 55 - zone_pressure * 8 + shield * 18
-
-
-def _see(board: chess.Board, move: chess.Move) -> int:
-    if not board.is_capture(move):
-        return 0
-    victim = chess.PAWN if board.is_en_passant(move) else board.piece_type_at(move.to_square)
-    if victim is None:
-        return 0
-    attacker = board.piece_type_at(move.from_square) or chess.PAWN
-    gain = PIECE_VALUE[victim] - PIECE_VALUE[attacker]
-    board.push(move)
-    try:
-        if board.is_attacked_by(board.turn, move.to_square):
-            defenders = board.attackers_mask(board.turn, move.to_square).bit_count()
-            gain -= PIECE_VALUE[attacker] // max(1, defenders)
-    finally:
-        board.pop()
-    return gain
-
-
 PASSED_MASKS: Final = tuple(
     tuple(_passed_mask(color, square) for square in chess.SQUARES)
     for color in (chess.BLACK, chess.WHITE)
@@ -199,19 +143,6 @@ def evaluate(board: chess.Board) -> int:
     mg += pawn_mg
     eg += pawn_eg
 
-    for color in (chess.WHITE, chess.BLACK):
-        sign = 1 if color == chess.WHITE else -1
-        safety = _king_safety(board, color)
-        king_square = board.king(color)
-        if king_square is not None:
-            king_file = chess.square_file(king_square)
-            if chess.square_rank(king_square) in (0, 7) and king_file in (2, 6):
-                safety += 45
-            elif board.has_castling_rights(color):
-                safety -= 35
-        mg += sign * safety
-        eg += sign * (safety // 2)
-
     phase = min(phase, MAX_PHASE)
     score = (mg * phase + eg * (MAX_PHASE - phase)) // MAX_PHASE
     score += 10 if board.turn == chess.WHITE else -10
@@ -254,6 +185,7 @@ class Engine:
         self.nodes = 0
         self.last_depth = 0
         self.last_score = 0
+        self.timed_out_during_next_depth = False
         self.killers: list[list[chess.Move | None]] = [[None, None] for _ in range(MAX_PLY)]
         self.history = [0] * (2 * 64 * 64)
         self.repetitions: dict[Hashable, int] = {}
@@ -276,6 +208,7 @@ class Engine:
         self.age += 1
         self.nodes = 0
         self.last_depth = 0
+        self.timed_out_during_next_depth = False
         self.repetition_tainted = False
         self.null_search = 0
         if len(legal_moves) == 1:
@@ -322,6 +255,7 @@ class Engine:
                 else:
                     score, move = self._root(board, depth, -INF, INF)
             except SearchTimeout:
+                self.timed_out_during_next_depth = True
                 break
             best_move = move
             previous_score = score
@@ -437,6 +371,7 @@ class Engine:
             and not in_check
             and depth >= 3
             and static_eval >= beta
+            and static_eval > -PIECE_VALUE[chess.QUEEN]
             and self._has_non_pawn_material(board, board.turn)
         ):
             reduction = 2 + depth // 5
@@ -470,15 +405,6 @@ class Engine:
             )
             gives_check = can_prune and board.gives_check(move)
             if can_prune and not gives_check:
-                continue
-            if (
-                not pv_node
-                and not in_check
-                and depth <= 3
-                and move_index > 0
-                and is_capture
-                and _see(board, move) < -60 * depth
-            ):
                 continue
 
             reduction = 0
@@ -573,10 +499,8 @@ class Engine:
         moves = self._ordered_moves(board, moves, None, min(ply, MAX_PLY - 1))
         for move in moves:
             if not in_check and move.promotion is None:
-                exchange = _see(board, move)
-                if exchange < 0:
-                    continue
-                if stand_pat + exchange + 180 < alpha:
+                victim = self._victim_value(board, move)
+                if stand_pat + victim + 180 < alpha:
                     continue
             board.push(move)
             child_key = _key(board)
@@ -608,7 +532,8 @@ class Engine:
             if move.promotion is not None:
                 return 10_000_000 + PIECE_VALUE[move.promotion]
             if board.is_capture(move):
-                return 8_000_000 + 16 * self._victim_value(board, move) + _see(board, move)
+                attacker = board.piece_type_at(move.from_square) or chess.PAWN
+                return 8_000_000 + 16 * self._victim_value(board, move) - PIECE_VALUE[attacker]
             if move == killer_pair[0]:
                 return 7_000_000
             if move == killer_pair[1]:
@@ -645,6 +570,8 @@ class Engine:
 
     def _tick(self) -> None:
         self.nodes += 1
+        if self.nodes % 50_000 == 0:
+            self._trim_tt()
         if self.nodes & self.time_check_mask == 0 and time.perf_counter() >= self.deadline:
             raise SearchTimeout
 
