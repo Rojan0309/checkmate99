@@ -4,6 +4,7 @@ adaptive time management, and a tapered positional evaluation."""
 from __future__ import annotations
 
 import math
+import sys
 import time
 from collections.abc import Hashable
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ MATE_BOUND: Final = 31_000
 MAX_PLY: Final = 96
 TT_LIMIT: Final = 250_000
 EVAL_CACHE_LIMIT: Final = 150_000
-ASSUMED_INCREMENT_MS: Final = 500  # published rules: 120s base + 0.5s per move
+ASSUMED_INCREMENT_MS: Final = 100  # conservative nudge; published rule is 0.5s/move
 
 EXACT: Final = 0
 LOWER: Final = 1
@@ -238,7 +239,10 @@ def evaluate(board: chess.Board) -> int:
                 mobility = (attacks & ~own_pieces).bit_count()
                 if piece_type not in (chess.PAWN, chess.KING):
                     pressure = (attacks & enemy_king_zone).bit_count()
-                    mg += sign * pressure * 4
+                    # Weighted well above the old value: this is one of the few signals
+                    # the engine has that a king hunt is developing, and it needs to be
+                    # strong enough to outweigh a tempting pawn grab elsewhere on the board.
+                    mg += sign * pressure * 10
                 if piece_type == chess.PAWN:
                     advance = _relative_rank(color, square)
                     mg += sign * (advance * 2 + centrality // 4)
@@ -446,6 +450,17 @@ class Engine:
             elif stable_count >= 3 and depth >= 7:
                 target_ms = max(soft_ms * 0.4, target_ms * 0.75)
 
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if elapsed_ms > 0:
+            nps = int(self.nodes / (elapsed_ms / 1000.0))
+        else:
+            nps = 0
+        print(
+            f"[depth={self.last_depth} nodes={self.nodes} nps={nps} "
+            f"time={elapsed_ms:.0f}ms clock={clock_ms}ms score={self.last_score}]",
+            file=sys.stderr,
+        )
+
         self._record_played_position(board, best_move)
         self._trim_tt()
         return best_move
@@ -468,11 +483,11 @@ class Engine:
         # Reserve is deliberately generous: SEE-driven ordering makes each node more
         # expensive than before, so the periodic clock check (see time_check_mask)
         # can overshoot by more real time than it used to at critically low clocks.
-        reserve_ms = max(80, min(1_500, clock_ms // 10))
+        reserve_ms = max(150, min(2000, clock_ms // 6))
         usable_ms = max(1, clock_ms - reserve_ms)
-        per_move_budget = usable_ms / moves_to_go + ASSUMED_INCREMENT_MS * 0.6
-        soft_ms = max(20.0, min(usable_ms * 0.5, per_move_budget))
-        hard_ms = max(soft_ms + 20.0, min(usable_ms * 0.85, soft_ms * 3.2))
+        per_move_budget = usable_ms / moves_to_go + ASSUMED_INCREMENT_MS * 0.4
+        soft_ms = max(15.0, min(usable_ms * 0.4, per_move_budget))
+        hard_ms = max(soft_ms + 15.0, min(usable_ms * 0.75, soft_ms * 2.0))
         return int(soft_ms), int(hard_ms)
 
     def _root(
@@ -493,7 +508,7 @@ class Engine:
         best_move = ordered[0][0]
         best_score = -INF
 
-        for move_index, (move, _is_quiet) in enumerate(ordered):
+        for move_index, (move, _is_quiet, _is_capture, _see_value) in enumerate(ordered):
             board.push(move)
             child_key = _key(board)
             self._push_repetition(child_key)
@@ -629,9 +644,7 @@ class Engine:
 
         best_score = -INF
         best_move: chess.Move | None = None
-        for move_index, (move, is_quiet) in enumerate(ordered):
-            is_capture = not is_quiet and board.is_capture(move)
-
+        for move_index, (move, is_quiet, is_capture, see_value) in enumerate(ordered):
             can_prune = (
                 depth == 1
                 and not pv_node
@@ -650,7 +663,7 @@ class Engine:
                 and depth <= 3
                 and move_index > 0
                 and is_capture
-                and see(board, move) < -60 * depth
+                and see_value < -60 * depth
             ):
                 continue
 
@@ -750,12 +763,11 @@ class Engine:
             ]
 
         ordered = self._ordered_moves(board, moves, None, min(ply, MAX_PLY - 1), None)
-        for move, _is_quiet in ordered:
+        for move, _is_quiet, _is_capture, see_value in ordered:
             if not in_check and move.promotion is None:
-                gain = see(board, move)
-                if gain < 0:
+                if see_value < 0:
                     continue
-                if stand_pat + gain + 120 < alpha:
+                if stand_pat + see_value + 120 < alpha:
                     continue
             board.push(move)
             child_key = _key(board)
@@ -778,21 +790,22 @@ class Engine:
         tt_move: chess.Move | None,
         ply: int,
         countermove: chess.Move | None,
-    ) -> list[tuple[chess.Move, bool]]:
+    ) -> list[tuple[chess.Move, bool, bool, int]]:
         color = board.turn
         killer_pair = self.killers[min(ply, MAX_PLY - 1)]
-        scored: list[tuple[int, chess.Move, bool]] = []
+        scored: list[tuple[int, chess.Move, bool, bool, int]] = []
 
         for move in moves:
             is_capture = board.is_capture(move)
             is_promotion = move.promotion is not None
             is_quiet = not is_capture and not is_promotion
+            see_value = 0
 
             if move == tt_move:
                 score = 1_000_000_000
             elif is_capture or is_promotion:
-                gain = see(board, move)
-                score = (100_000_000 + gain) if gain >= 0 else (-100_000_000 + gain)
+                see_value = see(board, move)
+                score = (100_000_000 + see_value) if see_value >= 0 else (-100_000_000 + see_value)
             elif move == killer_pair[0]:
                 score = 90_000_000
             elif move == killer_pair[1]:
@@ -802,10 +815,13 @@ class Engine:
             else:
                 score = self.history[self._history_index(color, move)]
 
-            scored.append((score, move, is_quiet))
+            scored.append((score, move, is_quiet, is_capture, see_value))
+
+        if time.perf_counter() >= self.deadline:
+            raise SearchTimeout
 
         scored.sort(key=lambda item: item[0], reverse=True)
-        return [(move, is_quiet) for _, move, is_quiet in scored]
+        return [(move, is_quiet, is_capture, see_value) for _, move, is_quiet, is_capture, see_value in scored]
 
     @staticmethod
     def _has_non_pawn_material(board: chess.Board, color: chess.Color) -> bool:
@@ -941,9 +957,6 @@ class Engine:
         return score
 
 
-_ENGINE = Engine()
-
-
 def _emergency_move(board: chess.Board, legal_moves: list[chess.Move]) -> chess.Move:
     """A cheap, non-search fallback used only if the main search raises unexpectedly:
     take an immediate mate if one exists, otherwise the best SEE-scored capture,
@@ -966,6 +979,9 @@ def _emergency_move(board: chess.Board, legal_moves: list[chess.Move]) -> chess.
     return best_move
 
 
+ENGINE = Engine()
+
+
 def get_move(fen: str, time_left_ms: int) -> str:
     """Return a legal move in UCI notation."""
     board = chess.Board(fen)
@@ -975,7 +991,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
     move: chess.Move | None = None
     try:
-        candidate = _ENGINE.choose_move(board, time_left_ms, legal_moves)
+        candidate = ENGINE.choose_move(board, time_left_ms, legal_moves)
         if candidate in board.legal_moves:
             move = candidate
     except Exception:
@@ -986,8 +1002,8 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
     fallback = _emergency_move(board, legal_moves)
     try:
-        _ENGINE._record_played_position(board, fallback)
-        _ENGINE._trim_tt()
+        ENGINE._record_played_position(board, fallback)
+        ENGINE._trim_tt()
     except Exception:
         pass
     return fallback.uci()

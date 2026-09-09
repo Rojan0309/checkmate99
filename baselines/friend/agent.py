@@ -1,9 +1,7 @@
-"""A classical chess agent: PVS/negamax search with SEE-driven ordering and pruning,
-adaptive time management, and a tapered positional evaluation."""
+"""A classical chess agent with iterative deepening and positional evaluation."""
 
 from __future__ import annotations
 
-import math
 import time
 from collections.abc import Hashable
 from dataclasses import dataclass
@@ -18,16 +16,12 @@ MATE_BOUND: Final = 31_000
 MAX_PLY: Final = 96
 TT_LIMIT: Final = 250_000
 EVAL_CACHE_LIMIT: Final = 150_000
-ASSUMED_INCREMENT_MS: Final = 500  # published rules: 120s base + 0.5s per move
 
 EXACT: Final = 0
 LOWER: Final = 1
 UPPER: Final = 2
 
-# Used for material scoring in evaluate() -- king intentionally 0 so it never enters a sum.
 PIECE_VALUE: Final = (0, 100, 320, 330, 500, 900, 0)
-# Used inside SEE, where a "captured king" must never look free.
-SEE_VALUE: Final = (0, 100, 320, 330, 500, 900, 20_000)
 PHASE_VALUE: Final = (0, 0, 1, 1, 2, 4, 0)
 MAX_PHASE: Final = 24
 
@@ -36,18 +30,6 @@ ADJACENT_FILES: Final = tuple(
     (chess.BB_FILES[file_index - 1] if file_index else 0)
     | (chess.BB_FILES[file_index + 1] if file_index < 7 else 0)
     for file_index in range(8)
-)
-
-LMR_MAX_DEPTH: Final = 64
-LMR_MAX_INDEX: Final = 64
-LMR_TABLE: Final = tuple(
-    tuple(
-        int(0.5 + math.log(depth) * math.log(move_index) * 0.5)
-        if depth > 0 and move_index > 0
-        else 0
-        for move_index in range(LMR_MAX_INDEX)
-    )
-    for depth in range(LMR_MAX_DEPTH)
 )
 
 
@@ -68,9 +50,8 @@ def _key(board: chess.Board) -> Hashable:
     return board._transposition_key()
 
 
-def _tt_key(board: chess.Board, position_key: Hashable | None = None) -> tuple[Hashable, int]:
-    key = _key(board) if position_key is None else position_key
-    return key, board.halfmove_clock
+def _tt_key(board: chess.Board) -> tuple[Hashable, int]:
+    return _key(board), board.halfmove_clock
 
 
 def _relative_rank(color: chess.Color, square: chess.Square) -> int:
@@ -86,112 +67,6 @@ def _passed_mask(color: chess.Color, square: chess.Square) -> int:
     return files & ahead & chess.BB_ALL
 
 
-PASSED_MASKS: Final = tuple(
-    tuple(_passed_mask(color, square) for square in chess.SQUARES)
-    for color in (chess.BLACK, chess.WHITE)
-)
-
-
-# ---------------------------------------------------------------------------
-# Static Exchange Evaluation
-#
-# python-chess exposes attackers_mask(color, square, occupied) on recent versions,
-# which is exactly what SEE needs (it lets us ask "who attacks this square" against
-# a *hypothetical* occupancy as pieces are removed during the simulated exchange,
-# correctly revealing x-ray attackers). We probe for it once at import time and fall
-# back to a same-board approximation (no x-ray awareness, but still far better than
-# no SEE at all) if it isn't available. Every public entry point is wrapped so a
-# bug here degrades to a cheap heuristic instead of ever crashing the search.
-# ---------------------------------------------------------------------------
-
-
-def _detect_attackers_mask_supports_occupied() -> bool:
-    try:
-        probe = chess.Board()
-        probe.attackers_mask(chess.WHITE, chess.E4, probe.occupied)
-        return True
-    except (TypeError, AttributeError):
-        return False
-
-
-_ATTACKERS_SUPPORTS_OCCUPIED: Final = _detect_attackers_mask_supports_occupied()
-
-
-def _attackers_for_see(board: chess.Board, color: chess.Color, square: chess.Square, occupied: int) -> int:
-    if _ATTACKERS_SUPPORTS_OCCUPIED:
-        return board.attackers_mask(color, square, occupied)
-    return int(board.attackers(color, square)) & occupied
-
-
-def _least_valuable_attacker(
-    board: chess.Board, attackers: int, color: chess.Color
-) -> tuple[int | None, int]:
-    for piece_type in range(1, 7):
-        subset = attackers & board.pieces_mask(piece_type, color)
-        if subset:
-            square = (subset & -subset).bit_length() - 1
-            return square, piece_type
-    return None, 0
-
-
-def _see_impl(board: chess.Board, move: chess.Move) -> int:
-    to_square = move.to_square
-    from_square = move.from_square
-    mover_color = board.turn
-
-    if board.is_en_passant(move):
-        captured_value = PIECE_VALUE[chess.PAWN]
-        capture_removal_square = to_square + (-8 if mover_color == chess.WHITE else 8)
-    else:
-        captured_piece_type = board.piece_type_at(to_square)
-        captured_value = PIECE_VALUE[captured_piece_type] if captured_piece_type else 0
-        capture_removal_square = to_square
-
-    attacker_piece_type = board.piece_type_at(from_square) or chess.PAWN
-    if move.promotion:
-        promotion_gain = PIECE_VALUE[move.promotion] - PIECE_VALUE[chess.PAWN]
-        current_value = SEE_VALUE[move.promotion]
-    else:
-        promotion_gain = 0
-        current_value = SEE_VALUE[attacker_piece_type]
-
-    occupied = board.occupied
-    occupied &= ~chess.BB_SQUARES[from_square]
-    if capture_removal_square != to_square:
-        occupied &= ~chess.BB_SQUARES[capture_removal_square]
-    occupied |= chess.BB_SQUARES[to_square]
-
-    gains = [captured_value + promotion_gain]
-    side = not mover_color
-
-    for _ in range(32):
-        attackers = _attackers_for_see(board, side, to_square, occupied)
-        square, piece_type = _least_valuable_attacker(board, attackers, side)
-        if square is None:
-            break
-        gains.append(current_value - gains[-1])
-        occupied &= ~chess.BB_SQUARES[square]
-        current_value = SEE_VALUE[piece_type]
-        side = not side
-
-    for index in range(len(gains) - 1, 0, -1):
-        gains[index - 1] = -max(-gains[index - 1], gains[index])
-    return gains[0]
-
-
-def see(board: chess.Board, move: chess.Move) -> int:
-    """Net material result (centipawns) of the full capture sequence a capture or
-    promotion touches off, assuming best play by both sides. Falls back to a cheap
-    heuristic on any unexpected error, so a SEE bug can never crash the search."""
-    try:
-        return _see_impl(board, move)
-    except Exception:
-        captured_piece_type = board.piece_type_at(move.to_square)
-        captured_value = PIECE_VALUE[captured_piece_type] if captured_piece_type else 0
-        attacker_piece_type = board.piece_type_at(move.from_square) or chess.PAWN
-        return captured_value - PIECE_VALUE[attacker_piece_type] // 10
-
-
 def _king_zone(board: chess.Board, color: chess.Color) -> int:
     king_square = board.king(color)
     if king_square is None:
@@ -205,10 +80,53 @@ def _king_zone(board: chess.Board, color: chess.Color) -> int:
             continue
         for file_offset in (-1, 0, 1):
             target_file = king_file + file_offset
-            if not 0 <= target_file < 8:
-                continue
-            zone |= chess.BB_SQUARES[chess.square(target_file, target_rank)]
+            if 0 <= target_file < 8:
+                zone |= chess.BB_SQUARES[chess.square(target_file, target_rank)]
     return zone
+
+
+def _king_safety(board: chess.Board, color: chess.Color) -> int:
+    king_square = board.king(color)
+    if king_square is None:
+        return -MATE
+    enemy = not color
+    zone = _king_zone(board, color)
+    pressure = (board.attackers_mask(enemy, king_square) & chess.BB_ALL).bit_count()
+    zone_pressure = 0
+    for square in chess.scan_reversed(zone):
+        zone_pressure += (board.attackers_mask(enemy, square) & chess.BB_ALL).bit_count()
+    own_pawns = board.pieces_mask(chess.PAWN, color)
+    shield_rank = chess.square_rank(king_square) + (1 if color else -1)
+    shield = 0
+    if 0 <= shield_rank < 8:
+        king_file = chess.square_file(king_square)
+        for file_index in range(max(0, king_file - 1), min(7, king_file + 1) + 1):
+            shield += bool(own_pawns & chess.BB_SQUARES[chess.square(file_index, shield_rank)])
+    return -pressure * 55 - zone_pressure * 8 + shield * 18
+
+
+def _see(board: chess.Board, move: chess.Move) -> int:
+    if not board.is_capture(move):
+        return 0
+    victim = chess.PAWN if board.is_en_passant(move) else board.piece_type_at(move.to_square)
+    if victim is None:
+        return 0
+    attacker = board.piece_type_at(move.from_square) or chess.PAWN
+    gain = PIECE_VALUE[victim] - PIECE_VALUE[attacker]
+    board.push(move)
+    try:
+        if board.is_attacked_by(board.turn, move.to_square):
+            defenders = board.attackers_mask(board.turn, move.to_square).bit_count()
+            gain -= PIECE_VALUE[attacker] // max(1, defenders)
+    finally:
+        board.pop()
+    return gain
+
+
+PASSED_MASKS: Final = tuple(
+    tuple(_passed_mask(color, square) for square in chess.SQUARES)
+    for color in (chess.BLACK, chess.WHITE)
+)
 
 
 def evaluate(board: chess.Board) -> int:
@@ -216,13 +134,9 @@ def evaluate(board: chess.Board) -> int:
     eg = 0
     phase = 0
 
-    white_king_zone = _king_zone(board, chess.WHITE)
-    black_king_zone = _king_zone(board, chess.BLACK)
-
     for color in (chess.WHITE, chess.BLACK):
         sign = 1 if color == chess.WHITE else -1
         own_pieces = board.occupied_co[color]
-        enemy_king_zone = black_king_zone if color == chess.WHITE else white_king_zone
         for piece_type in chess.PIECE_TYPES:
             pieces = board.pieces_mask(piece_type, color)
             count = pieces.bit_count()
@@ -234,11 +148,7 @@ def evaluate(board: chess.Board) -> int:
                 file_index = chess.square_file(square)
                 rank = chess.square_rank(square)
                 centrality = 14 - abs(2 * file_index - 7) - abs(2 * rank - 7)
-                attacks = board.attacks_mask(square)
-                mobility = (attacks & ~own_pieces).bit_count()
-                if piece_type not in (chess.PAWN, chess.KING):
-                    pressure = (attacks & enemy_king_zone).bit_count()
-                    mg += sign * pressure * 4
+                mobility = (board.attacks_mask(square) & ~own_pieces).bit_count()
                 if piece_type == chess.PAWN:
                     advance = _relative_rank(color, square)
                     mg += sign * (advance * 2 + centrality // 4)
@@ -271,9 +181,6 @@ def evaluate(board: chess.Board) -> int:
                 eg += sign * 12
             elif not pawns & FILE_MASKS[file_index]:
                 mg += sign * 10
-            if _relative_rank(color, square) == 6:
-                mg += sign * 12
-                eg += sign * 22
 
         king_square = board.king(color)
         if king_square is not None:
@@ -291,6 +198,19 @@ def evaluate(board: chess.Board) -> int:
     )
     mg += pawn_mg
     eg += pawn_eg
+
+    for color in (chess.WHITE, chess.BLACK):
+        sign = 1 if color == chess.WHITE else -1
+        safety = _king_safety(board, color)
+        king_square = board.king(color)
+        if king_square is not None:
+            king_file = chess.square_file(king_square)
+            if chess.square_rank(king_square) in (0, 7) and king_file in (2, 6):
+                safety += 45
+            elif board.has_castling_rights(color):
+                safety -= 35
+        mg += sign * safety
+        eg += sign * (safety // 2)
 
     phase = min(phase, MAX_PHASE)
     score = (mg * phase + eg * (MAX_PHASE - phase)) // MAX_PHASE
@@ -336,7 +256,6 @@ class Engine:
         self.last_score = 0
         self.killers: list[list[chess.Move | None]] = [[None, None] for _ in range(MAX_PLY)]
         self.history = [0] * (2 * 64 * 64)
-        self.countermoves: dict[tuple[int, int], chess.Move] = {}
         self.repetitions: dict[Hashable, int] = {}
         self.repeated_positions = 0
         self.repetition_tainted = False
@@ -370,110 +289,50 @@ class Engine:
         if clock_ms <= 30:
             self._record_played_position(board, legal_moves[0])
             return legal_moves[0]
-
-        soft_ms, hard_ms = self._time_budget(board, clock_ms)
+        reserve_ms = max(15, min(500, clock_ms // 20))
+        usable_ms = max(1, clock_ms - reserve_ms)
+        soft_ms = min(4_500, max(5, int(clock_ms * 0.035)))
+        hard_ms = min(usable_ms, max(soft_ms + 5, int(soft_ms * 1.65)))
         started = time.perf_counter()
         self.deadline = started + hard_ms / 1000.0
         if clock_ms < 250:
-            self.time_check_mask = 1
-        elif clock_ms < 1_000:
             self.time_check_mask = 7
-        elif clock_ms < 5_000:
+        elif clock_ms < 1_000:
             self.time_check_mask = 31
-        else:
+        elif clock_ms < 5_000:
             self.time_check_mask = 127
+        else:
+            self.time_check_mask = 511
 
         entry = self.tt.get(_tt_key(board))
-        last_move = board.peek() if board.move_stack else None
-        countermove = (
-            self.countermoves.get((last_move.from_square, last_move.to_square))
-            if last_move is not None
-            else None
-        )
-        ordered = self._ordered_moves(
-            board, legal_moves, entry.move if entry else None, 0, countermove
-        )
-        best_move = ordered[0][0]
+        ordered = self._ordered_moves(board, legal_moves, entry.move if entry else None, 0)
+        best_move = ordered[0]
         previous_score = 0
-        last_best_move: chess.Move | None = None
-        stable_count = 0
-        target_ms = float(soft_ms)
 
         for depth in range(1, 64):
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-            if depth > 1 and elapsed_ms >= target_ms:
+            if depth > 1 and (time.perf_counter() - started) * 1000.0 >= soft_ms:
                 break
             try:
                 if depth >= 4:
-                    window = 25
-                    alpha = max(-INF, previous_score - window)
-                    beta = min(INF, previous_score + window)
-                    attempts = 0
-                    while True:
-                        score, move = self._root(board, depth, alpha, beta)
-                        attempts += 1
-                        if score <= alpha and alpha > -INF and attempts < 4:
-                            window *= 3
-                            alpha = max(-INF, previous_score - window)
-                        elif score >= beta and beta < INF and attempts < 4:
-                            window *= 3
-                            beta = min(INF, previous_score + window)
-                        elif score <= alpha or score >= beta:
-                            score, move = self._root(board, depth, -INF, INF)
-                            break
-                        else:
-                            break
+                    alpha = max(-INF, previous_score - 35)
+                    beta = min(INF, previous_score + 35)
+                    score, move = self._root(board, depth, alpha, beta)
+                    if score <= alpha or score >= beta:
+                        score, move = self._root(board, depth, -INF, INF)
                 else:
                     score, move = self._root(board, depth, -INF, INF)
             except SearchTimeout:
                 break
-
-            changed = last_best_move is not None and move != last_best_move
-            dropped = last_best_move is not None and score < previous_score - 40
-            stable_count = 0 if (changed or dropped) else stable_count + 1
-
             best_move = move
-            last_best_move = move
             previous_score = score
             self.last_depth = depth
             self.last_score = score
-
             if abs(score) >= MATE_BOUND:
                 break
-
-            if (changed or dropped) and depth >= 4:
-                target_ms = min(float(hard_ms), target_ms * 1.7)
-            elif stable_count >= 3 and depth >= 7:
-                target_ms = max(soft_ms * 0.4, target_ms * 0.75)
 
         self._record_played_position(board, best_move)
         self._trim_tt()
         return best_move
-
-    def _time_budget(self, board: chess.Board, clock_ms: int) -> tuple[int, int]:
-        non_king_material = sum(
-            PIECE_VALUE[piece_type]
-            * (
-                board.pieces_mask(piece_type, chess.WHITE) | board.pieces_mask(piece_type, chess.BLACK)
-            ).bit_count()
-            for piece_type in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
-        )
-        if non_king_material > 5_000:
-            moves_to_go = 32
-        elif non_king_material > 2_500:
-            moves_to_go = 24
-        else:
-            moves_to_go = 16
-
-        # Reserve is deliberately generous: SEE-driven ordering makes each node more
-        # expensive than before, so the periodic clock check (see time_check_mask)
-        # can overshoot by more real time than it used to at critically low clocks.
-        reserve_ms = max(80, min(1_500, clock_ms // 10))
-        usable_ms = max(1, clock_ms - reserve_ms)
-        per_move_budget = usable_ms / moves_to_go + ASSUMED_INCREMENT_MS * 0.6
-        soft_ms = max(20.0, min(usable_ms * 0.5, per_move_budget))
-        hard_ms = max(soft_ms + 20.0, min(usable_ms * 0.85, soft_ms * 3.2))
-        return int(soft_ms), int(hard_ms)
 
     def _root(
         self, board: chess.Board, depth: int, alpha: int, beta: int
@@ -481,19 +340,13 @@ class Engine:
         original_alpha = alpha
         key = _tt_key(board)
         entry = self.tt.get(key)
-        last_move = board.peek() if board.move_stack else None
-        countermove = (
-            self.countermoves.get((last_move.from_square, last_move.to_square))
-            if last_move is not None
-            else None
+        moves = self._ordered_moves(
+            board, list(board.legal_moves), entry.move if entry else None, 0
         )
-        ordered = self._ordered_moves(
-            board, list(board.legal_moves), entry.move if entry else None, 0, countermove
-        )
-        best_move = ordered[0][0]
+        best_move = moves[0]
         best_score = -INF
 
-        for move_index, (move, _is_quiet) in enumerate(ordered):
+        for move_index, move in enumerate(moves):
             board.push(move)
             child_key = _key(board)
             self._push_repetition(child_key)
@@ -540,12 +393,6 @@ class Engine:
         if depth <= 0:
             return self._quiescence(board, alpha, beta, ply)
 
-        mate_alpha = max(alpha, -MATE + ply)
-        mate_beta = min(beta, MATE - ply - 1)
-        if mate_alpha >= mate_beta:
-            return mate_alpha
-        alpha, beta = mate_alpha, mate_beta
-
         moves: list[chess.Move] | None = None
         if self._is_insufficient_material(board):
             return 0
@@ -563,7 +410,7 @@ class Engine:
             return self._evaluate(board, position_key)
 
         original_alpha = alpha
-        key = _tt_key(board, position_key)
+        key = _tt_key(board)
         entry = self.tt.get(key)
         tt_move = entry.move if entry else None
         tt_allowed = not self.repetition_tainted and self.repeated_positions == 0
@@ -582,20 +429,6 @@ class Engine:
             moves = list(board.legal_moves)
         if not moves:
             return -MATE + ply if in_check else 0
-
-        if (
-            not pv_node
-            and not in_check
-            and depth <= 7
-            and abs(beta) < MATE_BOUND
-            and static_eval - 85 * depth >= beta
-        ):
-            return static_eval
-
-        if not pv_node and not in_check and depth == 1 and static_eval + 300 <= alpha:
-            razor_score = self._quiescence(board, alpha, beta, ply)
-            if razor_score <= alpha:
-                return razor_score
 
         # Non-pawn material reduces null-move errors in zugzwang endgames.
         if (
@@ -619,18 +452,13 @@ class Engine:
             if score >= beta:
                 return score
 
-        last_move = board.peek() if board.move_stack else None
-        countermove = (
-            self.countermoves.get((last_move.from_square, last_move.to_square))
-            if last_move is not None
-            else None
-        )
-        ordered = self._ordered_moves(board, moves, tt_move, ply, countermove)
+        moves = self._ordered_moves(board, moves, tt_move, ply)
 
         best_score = -INF
         best_move: chess.Move | None = None
-        for move_index, (move, is_quiet) in enumerate(ordered):
-            is_capture = not is_quiet and board.is_capture(move)
+        for move_index, move in enumerate(moves):
+            is_capture = board.is_capture(move)
+            is_quiet = not is_capture and move.promotion is None
 
             can_prune = (
                 depth == 1
@@ -643,14 +471,13 @@ class Engine:
             gives_check = can_prune and board.gives_check(move)
             if can_prune and not gives_check:
                 continue
-
             if (
                 not pv_node
                 and not in_check
                 and depth <= 3
                 and move_index > 0
                 and is_capture
-                and see(board, move) < -60 * depth
+                and _see(board, move) < -60 * depth
             ):
                 continue
 
@@ -666,10 +493,7 @@ class Engine:
                 if board.gives_check(move):
                     gives_check = True
                 else:
-                    reduction = LMR_TABLE[min(depth, LMR_MAX_DEPTH - 1)][min(move_index, LMR_MAX_INDEX - 1)]
-                    if pv_node:
-                        reduction = max(0, reduction - 1)
-                    reduction = max(0, min(reduction, depth - 1))
+                    reduction = 1 + int(depth >= 6 and move_index >= 8)
 
             board.push(move)
             child_key = _key(board)
@@ -711,8 +535,6 @@ class Engine:
                     self.history[history_index] += depth * depth
                     if self.history[history_index] > 1_000_000:
                         self.history = [value // 2 for value in self.history]
-                    if last_move is not None:
-                        self.countermoves[(last_move.from_square, last_move.to_square)] = move
                 break
 
         if best_move is None:
@@ -738,7 +560,6 @@ class Engine:
 
         if in_check:
             moves = legal_moves
-            stand_pat = -INF
         else:
             stand_pat = self._evaluate(board, position_key)
             if stand_pat >= beta:
@@ -749,13 +570,13 @@ class Engine:
                 move for move in legal_moves if board.is_capture(move) or move.promotion is not None
             ]
 
-        ordered = self._ordered_moves(board, moves, None, min(ply, MAX_PLY - 1), None)
-        for move, _is_quiet in ordered:
+        moves = self._ordered_moves(board, moves, None, min(ply, MAX_PLY - 1))
+        for move in moves:
             if not in_check and move.promotion is None:
-                gain = see(board, move)
-                if gain < 0:
+                exchange = _see(board, move)
+                if exchange < 0:
                     continue
-                if stand_pat + gain + 120 < alpha:
+                if stand_pat + exchange + 180 < alpha:
                     continue
             board.push(move)
             child_key = _key(board)
@@ -777,35 +598,31 @@ class Engine:
         moves: list[chess.Move],
         tt_move: chess.Move | None,
         ply: int,
-        countermove: chess.Move | None,
-    ) -> list[tuple[chess.Move, bool]]:
+    ) -> list[chess.Move]:
         color = board.turn
         killer_pair = self.killers[min(ply, MAX_PLY - 1)]
-        scored: list[tuple[int, chess.Move, bool]] = []
 
-        for move in moves:
-            is_capture = board.is_capture(move)
-            is_promotion = move.promotion is not None
-            is_quiet = not is_capture and not is_promotion
-
+        def move_score(move: chess.Move) -> int:
             if move == tt_move:
-                score = 1_000_000_000
-            elif is_capture or is_promotion:
-                gain = see(board, move)
-                score = (100_000_000 + gain) if gain >= 0 else (-100_000_000 + gain)
-            elif move == killer_pair[0]:
-                score = 90_000_000
-            elif move == killer_pair[1]:
-                score = 89_000_000
-            elif countermove is not None and move == countermove:
-                score = 88_000_000
-            else:
-                score = self.history[self._history_index(color, move)]
+                return 20_000_000
+            if move.promotion is not None:
+                return 10_000_000 + PIECE_VALUE[move.promotion]
+            if board.is_capture(move):
+                return 8_000_000 + 16 * self._victim_value(board, move) + _see(board, move)
+            if move == killer_pair[0]:
+                return 7_000_000
+            if move == killer_pair[1]:
+                return 6_900_000
+            return self.history[self._history_index(color, move)]
 
-            scored.append((score, move, is_quiet))
+        moves.sort(key=move_score, reverse=True)
+        return moves
 
-        scored.sort(key=lambda item: item[0], reverse=True)
-        return [(move, is_quiet) for _, move, is_quiet in scored]
+    @staticmethod
+    def _victim_value(board: chess.Board, move: chess.Move) -> int:
+        if board.is_en_passant(move):
+            return PIECE_VALUE[chess.PAWN]
+        return PIECE_VALUE[board.piece_type_at(move.to_square) or 0]
 
     @staticmethod
     def _has_non_pawn_material(board: chess.Board, color: chess.Color) -> bool:
@@ -828,8 +645,6 @@ class Engine:
 
     def _tick(self) -> None:
         self.nodes += 1
-        if self.nodes % 50_000 == 0:
-            self._trim_tt()
         if self.nodes & self.time_check_mask == 0 and time.perf_counter() >= self.deadline:
             raise SearchTimeout
 
@@ -944,50 +759,15 @@ class Engine:
 _ENGINE = Engine()
 
 
-def _emergency_move(board: chess.Board, legal_moves: list[chess.Move]) -> chess.Move:
-    """A cheap, non-search fallback used only if the main search raises unexpectedly:
-    take an immediate mate if one exists, otherwise the best SEE-scored capture,
-    otherwise the first quiet move. Favours safety over speed."""
-    best_move = legal_moves[0]
-    best_score = -INF
-    for move in legal_moves:
-        if board.is_capture(move) or move.promotion is not None:
-            score = see(board, move)
-        else:
-            score = 0
-        board.push(move)
-        is_mate = board.is_checkmate()
-        board.pop()
-        if is_mate:
-            return move
-        if score > best_score:
-            best_score = score
-            best_move = move
-    return best_move
-
-
 def get_move(fen: str, time_left_ms: int) -> str:
     """Return a legal move in UCI notation."""
     board = chess.Board(fen)
     legal_moves = list(board.legal_moves)
     if not legal_moves:
         return "0000"  # The referee never requests a move from a terminal position.
-
-    move: chess.Move | None = None
+    fallback = legal_moves[0]
     try:
-        candidate = _ENGINE.choose_move(board, time_left_ms, legal_moves)
-        if candidate in board.legal_moves:
-            move = candidate
+        move = _ENGINE.choose_move(board, time_left_ms, legal_moves)
+        return move.uci() if move in board.legal_moves else fallback.uci()
     except Exception:
-        move = None
-
-    if move is not None:
-        return move.uci()
-
-    fallback = _emergency_move(board, legal_moves)
-    try:
-        _ENGINE._record_played_position(board, fallback)
-        _ENGINE._trim_tt()
-    except Exception:
-        pass
-    return fallback.uci()
+        return fallback.uci()
